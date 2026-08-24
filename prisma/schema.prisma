@@ -1,0 +1,325 @@
+// ============================================================================
+// PHASE 1: DATABASE ARCHITECTURE & SCHEMA
+// Prisma ORM Schema for High-Concurrency Ticket Booking System
+// Supports: Atomic Seat Holds (10m TTL), Waitlist FIFO Cascade, QR Verification
+// ============================================================================
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ----------------------------------------------------------------------------
+// ENUMS
+// ----------------------------------------------------------------------------
+
+enum UserRole {
+  ADMIN
+  ORGANISER
+  CUSTOMER
+  DOOR_STAFF
+}
+
+enum SeatCategory {
+  VIP
+  PREMIUM
+  STANDARD
+  ACCESSIBLE
+}
+
+enum SeatStatus {
+  AVAILABLE    // Ready for selection
+  HELD         // Temporarily reserved during checkout (TTL: 10 mins)
+  BOOKED       // Confirmed payment & issued ticket
+  OFFERED      // Reserved exclusively for a FIFO waitlist candidate (TTL: 15 mins)
+  BLOCKED      // Maintenance / venue blocked
+}
+
+enum BookingStatus {
+  PENDING_PAYMENT
+  CONFIRMED
+  CANCELLED
+  REFUNDED
+}
+
+enum WaitlistStatus {
+  PENDING      // Waiting in FIFO line
+  OFFERED      // Exclusive purchase offer sent with time-limited token
+  CLAIMED      // Converted to confirmed booking
+  EXPIRED      // Offer window lapsed without purchase; cascaded to next user
+  CANCELLED    // User opted out
+}
+
+enum EventType {
+  CONCERT
+  MOVIE
+  THEATRE
+  SPORTS
+  FESTIVAL
+}
+
+// ----------------------------------------------------------------------------
+// MODELS
+// ----------------------------------------------------------------------------
+
+model User {
+  id            String         @id @default(uuid())
+  email         String         @unique
+  passwordHash  String
+  fullName      String
+  phoneNumber   String?
+  role          UserRole       @default(CUSTOMER)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  // Relations
+  bookings      Booking[]
+  waitlists     Waitlist[]
+  heldSeats     ShowSeat[]     @relation("HeldByUser")
+  eventsManaged Event[]        @relation("OrganiserEvents")
+  auditLogs     AuditLog[]
+
+  @@index([email])
+  @@index([role])
+}
+
+model Venue {
+  id            String         @id @default(uuid())
+  name          String
+  slug          String         @unique
+  address       String
+  city          String
+  state         String?
+  country       String         @default("US")
+  postalCode    String?
+  totalCapacity Int
+  svgLayoutUrl  String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  // Relations
+  seats         Seat[]
+  showtimes     Showtime[]
+
+  @@index([city])
+}
+
+model Seat {
+  id            String         @id @default(uuid())
+  venueId       String
+  venue         Venue          @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  
+  // Physical & Grid Geometry
+  section       String         // e.g., "Orchestra", "Balcony", "Main Floor"
+  row           String         // e.g., "A", "B", "C"
+  number        Int            // e.g., 1, 2, 3...
+  gridX         Int            // Visual seat map horizontal coordinate
+  gridY         Int            // Visual seat map vertical coordinate
+  category      SeatCategory   @default(STANDARD)
+  isAccessible  Boolean        @default(false)
+  isActive      Boolean        @default(true)
+
+  // Relations
+  showSeats     ShowSeat[]
+
+  @@unique([venueId, section, row, number])
+  @@index([venueId, category])
+}
+
+model Event {
+  id            String         @id @default(uuid())
+  title         String
+  slug          String         @unique
+  description   String         @db.Text
+  eventType     EventType
+  durationMins  Int
+  posterUrl     String
+  bannerUrl     String?
+  ageRating     String?        // e.g., "PG-13", "18+"
+  artistOrCast  String?
+  organiserId   String
+  organiser     User           @relation("OrganiserEvents", fields: [organiserId], references: [id])
+  isPublished   Boolean        @default(false)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  // Relations
+  showtimes     Showtime[]
+  seatPricings  SeatPricing[]
+  waitlists     Waitlist[]
+
+  @@index([organiserId])
+  @@index([eventType])
+  @@index([isPublished])
+}
+
+model Showtime {
+  id            String         @id @default(uuid())
+  eventId       String
+  event         Event          @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  venueId       String
+  venue         Venue          @relation(fields: [venueId], references: [id])
+  
+  startTime     DateTime
+  endTime       DateTime
+  doorsOpenTime DateTime?
+  
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  // Relations
+  showSeats     ShowSeat[]
+  seatPricings  SeatPricing[]
+  bookings      Booking[]
+  waitlists     Waitlist[]
+
+  @@index([eventId, startTime])
+  @@index([venueId, startTime])
+}
+
+model SeatPricing {
+  id            String         @id @default(uuid())
+  showtimeId    String
+  showtime      Showtime       @relation(fields: [showtimeId], references: [id], onDelete: Cascade)
+  eventId       String
+  event         Event          @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  category      SeatCategory
+  priceCents    Int            // Stored in minor currency units (cents) to avoid floating point errors
+  currency      String         @default("INR")
+
+  @@unique([showtimeId, category])
+}
+
+model ShowSeat {
+  id               String         @id @default(uuid())
+  showtimeId       String
+  showtime         Showtime       @relation(fields: [showtimeId], references: [id], onDelete: Cascade)
+  seatId           String
+  seat             Seat           @relation(fields: [seatId], references: [id], onDelete: Cascade)
+  
+  // High-Concurrency State & Locks
+  status           SeatStatus     @default(AVAILABLE)
+  heldByUserId     String?
+  heldByUser       User?          @relation("HeldByUser", fields: [heldByUserId], references: [id])
+  holdExpiresAt    DateTime?      // 10-minute hold TTL cutoff
+  
+  // Optimistic concurrency control lock & version tracking
+  version          Int            @default(0)
+  lockToken        String?        // Ephemeral distributed lock ID (UUID)
+
+  // Waitlist reallocation allocation
+  offeredToWaitlistId String?     @unique
+  offeredWaitlist     Waitlist?   @relation("OfferedSeat", fields: [offeredToWaitlistId], references: [id])
+
+  // Confirmed booking link
+  bookingItemId    String?        @unique
+  bookingItem      BookingItem?   @relation(fields: [bookingItemId], references: [id])
+
+  updatedAt        DateTime       @updatedAt
+
+  @@unique([showtimeId, seatId])
+  @@index([showtimeId, status])
+  @@index([holdExpiresAt])
+}
+
+model Booking {
+  id               String         @id @default(uuid())
+  bookingReference String         @unique // Human-friendly format: e.g., "BK-2026-X99Q"
+  userId           String
+  user             User           @relation(fields: [userId], references: [id])
+  showtimeId       String
+  showtime         Showtime       @relation(fields: [showtimeId], references: [id])
+  
+  status           BookingStatus  @default(PENDING_PAYMENT)
+  totalAmountCents Int
+  currency         String         @default("INR")
+  
+  // Payment Integration
+  paymentIntentId  String?
+  paymentStatus    String?        // "SUCCEEDED", "REFUNDED", "FAILED"
+  paidAt           DateTime?
+  
+  // Tamper-Proof Cryptographic QR & Ticket Details
+  qrPayloadSignature String       // HMAC-SHA256 signature of { booking_id, user_id, seat_numbers, hash }
+  isScannedAtDoor    Boolean      @default(false)
+  scannedAt          DateTime?
+  scannedByStaffId   String?
+
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  // Relations
+  items            BookingItem[]
+
+  @@index([userId])
+  @@index([showtimeId])
+  @@index([bookingReference])
+}
+
+model BookingItem {
+  id               String         @id @default(uuid())
+  bookingId        String
+  booking          Booking        @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  seatId           String
+  showSeatId       String?
+  category         SeatCategory
+  priceCents       Int
+
+  // Reverse relation to ShowSeat
+  showSeat         ShowSeat?
+
+  createdAt        DateTime       @default(now())
+
+  @@index([bookingId])
+}
+
+model Waitlist {
+  id               String         @id @default(uuid())
+  eventId          String
+  event            Event          @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  showtimeId       String
+  showtime         Showtime       @relation(fields: [showtimeId], references: [id], onDelete: Cascade)
+  userId           String
+  user             User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  category         SeatCategory
+  requestedQuantity Int           @default(1)
+  
+  // FIFO Queue State Machine
+  status           WaitlistStatus @default(PENDING)
+  queuePosition    Int?
+  
+  // Time-Limited Purchase Offer
+  claimToken       String?        @unique // Signed cryptographic token for 1-click purchase
+  offerExpiresAt   DateTime?      // 15-minute offer TTL cutoff
+  notifiedAt       DateTime?
+  
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  // Reverse relation to offered seat
+  offeredSeat      ShowSeat?      @relation("OfferedSeat")
+
+  @@index([showtimeId, category, status, createdAt])
+  @@index([userId])
+  @@index([claimToken])
+}
+
+model AuditLog {
+  id               String         @id @default(uuid())
+  userId           String?
+  user             User?          @relation(fields: [userId], references: [id])
+  action           String         // "SEAT_HELD", "HOLD_EXPIRED", "BOOKING_CONFIRMED", "WAITLIST_OFFERED", "WAITLIST_CLAIMED", "BOOKING_CANCELLED"
+  entityType       String         // "ShowSeat", "Booking", "Waitlist"
+  entityId         String
+  metadataJson     String?        // Detailed payload snapshot
+  ipAddress        String?
+  createdAt        DateTime       @default(now())
+
+  @@index([action, createdAt])
+  @@index([entityType, entityId])
+}
